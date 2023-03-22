@@ -16,19 +16,19 @@ from refreezer.infrastructure.stack import (
 )
 
 
-@pytest.fixture
-def stack() -> RefreezerStack:
-    app = core.App()
-    stack = RefreezerStack(app, "refreezer")
-    core.Aspects.of(stack).add(
-        cdk_nag.AwsSolutionsChecks(log_ignores=True, verbose=True)
+def test_cdk_app() -> None:
+    import refreezer.app
+
+    refreezer.app.main()
+
+
+def test_cdk_nag(stack: RefreezerStack) -> None:
+    assertions.Annotations.from_stack(stack).has_no_error(
+        "*", assertions.Match.any_value()
     )
-    return stack
-
-
-@pytest.fixture
-def template(stack: RefreezerStack) -> assertions.Template:
-    return assertions.Template.from_stack(stack)
+    assertions.Annotations.from_stack(stack).has_no_warning(
+        "*", assertions.Match.any_value()
+    )
 
 
 def assert_resource_name_has_correct_type_and_props(
@@ -50,21 +50,6 @@ def get_logical_id(stack: RefreezerStack, resources_list: typing.List[str]) -> s
     cfnElement = node.default_child
     assert isinstance(cfnElement, core.CfnElement)
     return stack.get_logical_id(cfnElement)
-
-
-def test_cdk_app() -> None:
-    import refreezer.app
-
-    refreezer.app.main()
-
-
-def test_cdk_nag(stack: RefreezerStack) -> None:
-    assertions.Annotations.from_stack(stack).has_no_error(
-        "*", assertions.Match.any_value()
-    )
-    assertions.Annotations.from_stack(stack).has_no_warning(
-        "*", assertions.Match.any_value()
-    )
 
 
 def test_job_tracking_table_created_with_cfn_output(
@@ -118,7 +103,7 @@ def test_glacier_sns_topic_created(
         template,
         resources_list=resources_list,
         cfn_type="AWS::SNS::Topic",
-        props={"Properties": {"KmsMasterKeyId": assertions.Match.any_value()}},
+        props={},
     )
 
     template.has_output(
@@ -136,6 +121,17 @@ def test_glacier_sns_topic_created(
                         "Condition": {"Bool": {"aws:SecureTransport": False}},
                         "Effect": "Deny",
                         "Principal": {"AWS": "*"},
+                        "Resource": {"Ref": logical_id},
+                    },
+                    {
+                        "Action": "SNS:Publish",
+                        "Condition": {
+                            "StringEquals": {
+                                "AWS:SourceOwner": {"Ref": "AWS::AccountId"}
+                            }
+                        },
+                        "Effect": "Allow",
+                        "Principal": {"Service": "glacier.amazonaws.com"},
                         "Resource": {"Ref": logical_id},
                     },
                 ],
@@ -181,6 +177,10 @@ def test_get_inventory_step_function_created(
     logical_id = get_logical_id(stack, resources_list)
     topic_logical_id = get_logical_id(stack, ["AsyncFacilitatorTopic"])
     inventory_lambda_logical_id = get_logical_id(stack, ["InventoryChunkDownload"])
+    inventory_chunk_determination_logical_id = get_logical_id(
+        stack, ["InventoryChunkDetermination"]
+    )
+
     assert_resource_name_has_correct_type_and_props(
         stack,
         template,
@@ -206,15 +206,25 @@ def test_get_inventory_step_function_created(
                             {"Ref": topic_logical_id},
                             assertions.Match.string_like_regexp(
                                 r'"},"VaultName.\$":"\$.vault_name"},"Resource":"arn:aws:states:::aws-sdk:glacier:initiateJob"},'
-                                r'"DynamoDBPut":{"Type":"Pass","Next":"GenerateChunkArrayLambda"},'
-                                r'"GenerateChunkArrayLambda":{"Type":"Pass","Parameters":{"chunk_array":\["\d+-\d+"(,+"\d+-\d+")+\]},"Next":"DistributedMap"},'
+                                r'"DynamoDBPut":{"Type":"Pass","Parameters":{"InventorySize":\d+,"MaximumInventoryRecordSize":\d+,"ChunkSize":\d+},"Next":"GenerateChunkArrayLambda"},'
+                                r'"GenerateChunkArrayLambda":{"Next":"DistributedMap","Retry":\[{"ErrorEquals":\["Lambda.ServiceException","Lambda.AWSLambdaException","Lambda.SdkClientException"\],'
+                                r'"IntervalSeconds":\d+,"MaxAttempts":\d+,"BackoffRate":\d+}\],'
+                                r'"Type":"Task","Resource":"'
+                            ),
+                            {
+                                "Fn::GetAtt": [
+                                    inventory_chunk_determination_logical_id,
+                                    "Arn",
+                                ]
+                            },
+                            assertions.Match.string_like_regexp(
                                 r'"DistributedMap":{"Type":"Map","Next":"GlueOrderArchives","Iterator":{"StartAt":"InventoryChunkDownloadLambda",'
                                 r'"States":{"InventoryChunkDownloadLambda":{"End":true,"Retry":\[{"ErrorEquals":\["Lambda.ServiceException","Lambda.AWSLambdaException","Lambda.SdkClientException"\],'
                                 r'"IntervalSeconds":\d+,"MaxAttempts":\d+,"BackoffRate":\d+}],"Type":"Task","Resource":'
                             ),
                             {"Fn::GetAtt": [inventory_lambda_logical_id, "Arn"]},
                             assertions.Match.string_like_regexp(
-                                r'"ItemsPath":"\$.chunk_array"},'
+                                r'"ItemsPath":"\$.body"},'
                                 r'"GlueOrderArchives":{"Type":"Pass","Next":"InventoryValidationLambda"},'
                                 r'"InventoryValidationLambda":{"Type":"Pass","End":true'
                             ),
@@ -245,7 +255,7 @@ def test_chunk_retrieval_lambda_created(
             "Properties": {
                 "Handler": "refreezer.application.handlers.chunk_retrieval_lambda_handler",
                 "Runtime": "python3.9",
-                "MemorySize": 4096,
+                "MemorySize": 2560,
                 "Timeout": 900,
             },
         },
@@ -253,6 +263,32 @@ def test_chunk_retrieval_lambda_created(
 
     template.has_output(
         OutputKeys.CHUNK_RETRIEVAL_LAMBDA_ARN,
+        {"Value": {"Ref": logical_id}},
+    )
+
+
+def test_chunk_validation_lambda_created(
+    stack: RefreezerStack, template: assertions.Template
+) -> None:
+    resources_list = ["ChunkValidation"]
+    logical_id = get_logical_id(stack, resources_list)
+    assert_resource_name_has_correct_type_and_props(
+        stack,
+        template,
+        resources_list=resources_list,
+        cfn_type="AWS::Lambda::Function",
+        props={
+            "Properties": {
+                "Handler": "refreezer.application.handlers.chunk_validation_lambda_handler",
+                "Runtime": "python3.9",
+                "MemorySize": 128,
+                "Timeout": 180,
+            },
+        },
+    )
+
+    template.has_output(
+        OutputKeys.CHUNK_VALIDATION_LAMBDA_ARN,
         {"Value": {"Ref": logical_id}},
     )
 
@@ -278,4 +314,83 @@ def test_inventory_chunk_determination_created(
     template.has_output(
         OutputKeys.INVENTORY_CHUNK_DETERMINATION_LAMBDA_ARN,
         {"Value": {"Ref": logical_id}},
+    )
+
+
+def test_facilitator_lambda_created(
+    stack: RefreezerStack, template: assertions.Template
+) -> None:
+    match = assertions.Match()
+
+    template.has_resource_properties(
+        "AWS::Lambda::Function",
+        {
+            "Code": {
+                "S3Bucket": {"Fn::Sub": match.any_value()},
+                "S3Key": match.any_value(),
+            },
+            "Role": {
+                "Fn::GetAtt": [
+                    match.string_like_regexp("AsyncFacilitatorServiceRole*"),
+                    "Arn",
+                ]
+            },
+            "Handler": "refreezer.application.handlers.async_facilitator_handler",
+            "MemorySize": 256,
+            "Runtime": "python3.9",
+        },
+    )
+
+
+def test_facilitator_lambda_with_dynamoDb_event_source(
+    template: assertions.Template,
+) -> None:
+    match = assertions.Match()
+    template.has_resource_properties(
+        "AWS::Lambda::EventSourceMapping",
+        {
+            "FunctionName": {"Ref": match.any_value()},
+        },
+    )
+
+
+def test_facilitator_default_policy(
+    stack: RefreezerStack, template: assertions.Template
+) -> None:
+    match = assertions.Match()
+    db_resource_name = ["AsyncFacilitatorTable"]
+    facilitator_table_logical_id = get_logical_id(stack, db_resource_name)
+    template.has_resource_properties(
+        "AWS::IAM::Policy",
+        {
+            "PolicyDocument": {
+                "Statement": match.array_with(
+                    [
+                        {
+                            "Action": ["dynamodb:Query", "dynamodb:PutItem"],
+                            "Effect": "Allow",
+                            "Resource": [
+                                {"Fn::GetAtt": [facilitator_table_logical_id, "Arn"]},
+                                {"Ref": match.any_value()},
+                            ],
+                        },
+                        {
+                            "Action": [
+                                "dynamodb:DescribeStream",
+                                "dynamodb:GetRecords",
+                                "dynamodb:GetShardIterator",
+                                "dynamodb:ListStreams",
+                            ],
+                            "Effect": "Allow",
+                            "Resource": {
+                                "Fn::GetAtt": [
+                                    facilitator_table_logical_id,
+                                    "StreamArn",
+                                ]
+                            },
+                        },
+                    ]
+                )
+            }
+        },
     )

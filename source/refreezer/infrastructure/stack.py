@@ -24,6 +24,8 @@ from constructs import Construct
 from typing import Optional, Union
 
 from refreezer.mocking.mock_glacier_stack import MockingParams
+from aws_cdk.aws_sns_subscriptions import LambdaSubscription
+from aws_cdk.aws_lambda_event_sources import DynamoEventSource
 
 
 class OutputKeys:
@@ -32,9 +34,11 @@ class OutputKeys:
     OUTPUT_BUCKET_NAME = "OBN"
     INVENTORY_BUCKET_NAME = "IBN"
     CHUNK_RETRIEVAL_LAMBDA_ARN = "CRLA"
+    CHUNK_VALIDATION_LAMBDA_ARN = "CVLA"
     INVENTORY_CHUNK_RETRIEVAL_LAMBDA_ARN = "ICRLA"
     INVENTORY_RETRIEVAL_STATE_MACHINE_ARN = "IRSMA"
     INVENTORY_CHUNK_DETERMINATION_LAMBDA_ARN = "ICDLA"
+    ASYNC_FACILITATOR_LAMBDA_NAME = "AFLN"
 
 
 class RefreezerStack(Stack):
@@ -48,6 +52,9 @@ class RefreezerStack(Stack):
     ) -> None:
         super().__init__(scope, construct_id)
 
+        MAXIMUM_INVENTORY_RECORD_SIZE = 2**10 * 2
+        CHUNK_SIZE = 2**20 * 5
+
         self.outputs = {}
 
         table = dynamodb.Table(
@@ -57,6 +64,7 @@ class RefreezerStack(Stack):
                 name="job_id", type=dynamodb.AttributeType.STRING
             ),
             point_in_time_recovery=True,
+            stream=dynamodb.StreamViewType.NEW_AND_OLD_IMAGES,
         )
 
         self.outputs[OutputKeys.ASYNC_FACILITATOR_TABLE_NAME] = CfnOutput(
@@ -65,15 +73,7 @@ class RefreezerStack(Stack):
             value=table.table_name,
         )
 
-        sns_default_key = kms.Alias.from_alias_name(
-            self, "DefaultKeySNS", "alias/aws/sns"
-        )
-
-        topic = sns.Topic(
-            self,
-            "AsyncFacilitatorTopic",
-            master_key=sns_default_key,
-        )
+        topic = sns.Topic(self, "AsyncFacilitatorTopic")
 
         topic.add_to_resource_policy(
             iam.PolicyStatement(
@@ -85,10 +85,106 @@ class RefreezerStack(Stack):
             )
         )
 
+        topic.add_to_resource_policy(
+            iam.PolicyStatement(
+                actions=["SNS:Publish"],
+                effect=iam.Effect.ALLOW,
+                resources=[topic.topic_arn],
+                principals=[
+                    iam.ServicePrincipal("glacier.amazonaws.com"),
+                ],
+                conditions={"StringEquals": {"AWS:SourceOwner": Aws.ACCOUNT_ID}},
+            )
+        )
+
+        NagSuppressions.add_resource_suppressions(
+            topic.node.find_child("Resource"),
+            [
+                {
+                    "id": "AwsSolutions-SNS2",
+                    "reason": "SNS Topic does not have server-side encryption enabled to be able to receive notifications from Glacier",
+                },
+            ],
+        )
+
         self.outputs[OutputKeys.ASYNC_FACILITATOR_TOPIC_ARN] = CfnOutput(
             self,
             OutputKeys.ASYNC_FACILITATOR_TOPIC_ARN,
             value=topic.topic_arn,
+        )
+
+        facilitator_lambda = lambda_.Function(
+            self,
+            "AsyncFacilitator",
+            handler="refreezer.application.handlers.async_facilitator_handler",
+            code=lambda_.Code.from_asset("source"),
+            runtime=lambda_.Runtime.PYTHON_3_9,
+            memory_size=256,
+        )
+
+        facilitator_lambda.add_event_source(
+            DynamoEventSource(
+                table, starting_position=lambda_.StartingPosition.TRIM_HORIZON
+            )
+        )
+        facilitator_lambda.add_environment("DDB_TABLE_NAME", table.table_name)
+
+        topic.add_subscription(LambdaSubscription(facilitator_lambda))
+
+        self.outputs[OutputKeys.ASYNC_FACILITATOR_LAMBDA_NAME] = CfnOutput(
+            self,
+            OutputKeys.ASYNC_FACILITATOR_LAMBDA_NAME,
+            value=facilitator_lambda.function_name,
+        )
+
+        table.grant(facilitator_lambda, *["dynamodb:Query", "dynamodb:PutItem"])
+        table.grant_stream(
+            facilitator_lambda,
+            *[
+                "dynamodb:DescribeStream",
+                "dynamodb:GetRecords",
+                "dynamodb:GetShardIterator",
+                "dynamodb:ListStreams",
+            ],
+        )
+
+        assert facilitator_lambda.role is not None
+        NagSuppressions.add_resource_suppressions(
+            facilitator_lambda.role,
+            [
+                {
+                    "id": "AwsSolutions-IAM4",
+                    "reason": "CDK grants AWS managed policy for Lambda basic execution by default. Replacing it with a customer managed policy will be addressed later",
+                    "appliesTo": [
+                        "Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+                    ],
+                },
+            ],
+        )
+
+        assert facilitator_lambda.role is not None
+        NagSuppressions.add_resource_suppressions(
+            facilitator_lambda.role.node.find_child("DefaultPolicy").node.find_child(
+                "Resource"
+            ),
+            [
+                {
+                    "id": "AwsSolutions-IAM5",
+                    "reason": "When activating stream for dynamodb table. It automatically allow listStreams to all resources with a wildcard and should be suppressed",
+                    "appliesTo": [
+                        "Resource::<AsyncFacilitatorTable8420A92A.Arn>/stream/*",
+                        "Resource::*",
+                    ],
+                },
+                {
+                    "id": "AwsSolutions-IAM5",
+                    "reason": "Lambda permission needed to SendTaskSuccess and SendTaskFailure.",
+                    "appliesTo": [
+                        "Resource::arn:aws:states:<AWS::Region>:<AWS::AccountId>:stateMachine:InventoryRetrievalStateMachine*",
+                        "Resource::arn:aws:states:<AWS::Region>:<AWS::AccountId>:execution:InventoryRetrievalStateMachine*",
+                    ],
+                },
+            ],
         )
 
         # Bucket to store the restored vault.
@@ -207,14 +303,12 @@ class RefreezerStack(Stack):
 
         # TODO: To be replaced by DynamoDB Put custom state for Step Function SDK integration
         # pause the workflow using waitForTaskToken mechanism
-        dynamo_db_put = sfn.Pass(self, "DynamoDBPut")
-
-        # TODO: To be replaced by GenerateChunkArray LambdaInvoke task
-        # which will retrun the chunks array
-        parameters = {"chunk_array": ["0-499", "300-799"]}
-        generate_chunk_array_lambda = sfn.Pass(
-            self, "GenerateChunkArrayLambda", parameters=parameters
-        )
+        parameters = {
+            "InventorySize": 2**30 * 3,
+            "MaximumInventoryRecordSize": MAXIMUM_INVENTORY_RECORD_SIZE,
+            "ChunkSize": CHUNK_SIZE,
+        }
+        dynamo_db_put = sfn.Pass(self, "DynamoDBPut", parameters=parameters)
 
         inventory_chunk_determination_lambda = lambda_.Function(
             self,
@@ -223,6 +317,13 @@ class RefreezerStack(Stack):
             runtime=lambda_.Runtime.PYTHON_3_9,
             code=lambda_.Code.from_asset("source"),
             description="Lambda to generate the correct byte offsets to retrieve the inventory.",
+        )
+
+        generate_chunk_array_lambda = tasks.LambdaInvoke(
+            self,
+            "GenerateChunkArrayLambda",
+            lambda_function=inventory_chunk_determination_lambda,
+            payload_response_only=True,
         )
 
         self.outputs[OutputKeys.INVENTORY_CHUNK_DETERMINATION_LAMBDA_ARN] = CfnOutput(
@@ -268,7 +369,6 @@ class RefreezerStack(Stack):
             ],
         )
 
-        # Add lambda invoke step
         inventory_chunk_download_lambda = tasks.LambdaInvoke(
             self,
             "InventoryChunkDownloadLambda",
@@ -283,9 +383,7 @@ class RefreezerStack(Stack):
         )
 
         # TODO: To be replaced by Map state in Distributed mode
-        distributed_map_state = sfn.Map(
-            self, "DistributedMap", items_path="$.chunk_array"
-        )
+        distributed_map_state = sfn.Map(self, "DistributedMap", items_path="$.body")
         distributed_map_state.iterator(inventory_chunk_download_lambda)
 
         # TODO: To be replaced by Glue task
@@ -311,6 +409,21 @@ class RefreezerStack(Stack):
 
         inventory_retrieval_state_machine = sfn.StateMachine(
             self, "InventoryRetrievalStateMachine", definition=definition
+        )
+
+        facilitator_lambda.add_to_role_policy(
+            iam.PolicyStatement(
+                effect=iam.Effect.ALLOW,
+                actions=[
+                    "states:SendTaskSuccess",
+                    "states:DescribeExecution",
+                    "states:SendTaskFailure",
+                ],
+                resources=[
+                    f"arn:aws:states:{Aws.REGION}:{Aws.ACCOUNT_ID}:stateMachine:InventoryRetrievalStateMachine*",
+                    f"arn:aws:states:{Aws.REGION}:{Aws.ACCOUNT_ID}:execution:InventoryRetrievalStateMachine*",
+                ],
+            ),
         )
 
         initiate_job_state_policy.attach_to_role(inventory_retrieval_state_machine.role)
@@ -346,6 +459,31 @@ class RefreezerStack(Stack):
             ],
         )
 
+        assert isinstance(
+            inventory_chunk_determination_lambda.node.default_child, CfnElement
+        )
+        assert inventory_chunk_determination_lambda.role is not None
+        inventory_chunk_determination_lambda_logical_id = Stack.of(self).get_logical_id(
+            inventory_chunk_determination_lambda.node.default_child
+        )
+
+        NagSuppressions.add_resource_suppressions(
+            inventory_retrieval_state_machine.role.node.find_child(
+                "DefaultPolicy"
+            ).node.find_child("Resource"),
+            [
+                {
+                    "id": "AwsSolutions-IAM5",
+                    "reason": "By default wildcard permission is granted to the lambda.  This will be replaced with a proper IAM role later.",
+                    "appliesTo": [
+                        "Resource::<"
+                        + inventory_chunk_determination_lambda_logical_id
+                        + ".Arn>:*"
+                    ],
+                }
+            ],
+        )
+
         NagSuppressions.add_resource_suppressions(
             inventory_retrieval_state_machine,
             [
@@ -360,13 +498,23 @@ class RefreezerStack(Stack):
             ],
         )
 
+        boto3_lambda_layer = lambda_.LayerVersion(
+            self,
+            "boto3_lambda_layer",
+            code=lambda_.Code.from_asset("layers/boto3.zip"),
+            compatible_runtimes=[lambda_.Runtime.PYTHON_3_9],
+            license="Apache-2.0",
+            description="A Boto3 layer to use (v1.26.70) rather than the default provided by lambda",
+        )
+
         chunk_retrieval_lambda = lambda_.Function(
             self,
             "ChunkRetrieval",
             handler="refreezer.application.handlers.chunk_retrieval_lambda_handler",
             runtime=lambda_.Runtime.PYTHON_3_9,
             code=lambda_.Code.from_asset("source"),
-            memory_size=4096,
+            layers=[boto3_lambda_layer],
+            memory_size=2560,
             timeout=Duration.minutes(15),
             description="Lambda to retrieve chunks from Glacier, upload them to S3 and generate file checksums.",
         )
@@ -424,6 +572,38 @@ class RefreezerStack(Stack):
         assert chunk_retrieval_lambda.role is not None
         NagSuppressions.add_resource_suppressions(
             chunk_retrieval_lambda.role.node.find_child("Resource"),
+            [
+                {
+                    "id": "AwsSolutions-IAM4",
+                    "reason": "CDK grants AWS managed policy for Lambda basic execution by default. Replacing it with a customer managed policy will be addressed later.",
+                    "appliesTo": [
+                        "Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+                    ],
+                }
+            ],
+        )
+
+        chunk_validation_lambda = lambda_.Function(
+            self,
+            "ChunkValidation",
+            handler="refreezer.application.handlers.chunk_validation_lambda_handler",
+            runtime=lambda_.Runtime.PYTHON_3_9,
+            code=lambda_.Code.from_asset("source"),
+            layers=[boto3_lambda_layer],
+            memory_size=128,
+            timeout=Duration.minutes(3),
+            description="Lambda to validate retrieved chunks and complete the S3 multipart upload.",
+        )
+
+        self.outputs[OutputKeys.CHUNK_VALIDATION_LAMBDA_ARN] = CfnOutput(
+            self,
+            OutputKeys.CHUNK_VALIDATION_LAMBDA_ARN,
+            value=chunk_validation_lambda.function_name,
+        )
+
+        assert chunk_validation_lambda.role is not None
+        NagSuppressions.add_resource_suppressions(
+            chunk_validation_lambda.role.node.find_child("Resource"),
             [
                 {
                     "id": "AwsSolutions-IAM4",
