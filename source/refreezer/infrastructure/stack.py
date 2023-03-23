@@ -29,6 +29,7 @@ from aws_cdk.aws_lambda_event_sources import DynamoEventSource
 
 
 class OutputKeys:
+    ARCHIVE_PARTS_TABLE_NAME = "APTN"
     ASYNC_FACILITATOR_TABLE_NAME = "AFTN"
     ASYNC_FACILITATOR_TOPIC_ARN = "AFTA"
     OUTPUT_BUCKET_NAME = "OBN"
@@ -71,6 +72,25 @@ class RefreezerStack(Stack):
             self,
             OutputKeys.ASYNC_FACILITATOR_TABLE_NAME,
             value=table.table_name,
+        )
+
+        archive_parts_table = dynamodb.Table(
+            self,
+            "ArchivePartsTable",
+            partition_key=dynamodb.Attribute(
+                name="archive_id", type=dynamodb.AttributeType.STRING
+            ),
+            sort_key=dynamodb.Attribute(
+                name="part_number", type=dynamodb.AttributeType.NUMBER
+            ),
+            point_in_time_recovery=True,
+            stream=dynamodb.StreamViewType.NEW_AND_OLD_IMAGES,
+        )
+
+        self.outputs[OutputKeys.ARCHIVE_PARTS_TABLE_NAME] = CfnOutput(
+            self,
+            OutputKeys.ARCHIVE_PARTS_TABLE_NAME,
+            value=archive_parts_table.table_name,
         )
 
         topic = sns.Topic(self, "AsyncFacilitatorTopic")
